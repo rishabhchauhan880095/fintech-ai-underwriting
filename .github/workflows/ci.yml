@@ -32,47 +32,137 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
 
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
+
       - name: Checkout code
         uses: actions/checkout@v4
 
+
+      # GitHub OIDC -> AWS IAM Role
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ap-south-1
 
+
+      # Login to ECR
       - name: Login to ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+
+      # Build and push image
       - name: Build and push Docker image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: fintech-ai-platform
           IMAGE_TAG: ${{ github.sha }}
+
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-      - name: Deploy to EC2
+
+            - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            aws ecr get-login-password --region ap-south-1 | sudo docker login --username AWS --password-stdin 791895111672.dkr.ecr.ap-south-1.amazonaws.com
 
-            sudo docker pull 791895111672.dkr.ecr.ap-south-1.amazonaws.com/fintech-ai-platform:${{ github.sha }}
+          script: |
+            set -e
+
+            ECR_REGISTRY="791895111672.dkr.ecr.ap-south-1.amazonaws.com"
+            IMAGE="$ECR_REGISTRY/fintech-ai-platform:${{ github.sha }}"
+
+            echo "Logging into ECR..."
+
+            aws ecr get-login-password --region ap-south-1 | \
+              sudo docker login \
+              --username AWS \
+              --password-stdin $ECR_REGISTRY
+
+            echo "Pulling new image..."
+
+            sudo docker pull $IMAGE
+
+            echo "Saving current container..."
+
+            OLD_IMAGE=$(sudo docker inspect fintech-api \
+              --format='{{.Config.Image}}' 2>/dev/null || echo "")
+
+            echo "Previous image: $OLD_IMAGE"
+
+            echo "Stopping old container..."
 
             sudo docker stop fintech-api || true
             sudo docker rm fintech-api || true
 
+            echo "Starting new container..."
+
             sudo docker run -d \
               --name fintech-api \
               -p 8000:8000 \
-              791895111672.dkr.ecr.ap-south-1.amazonaws.com/fintech-ai-platform:${{ github.sha }}
+              $IMAGE
+
+            echo "Waiting for application..."
+
+            sleep 10
+
+            echo "Checking application health..."
+
+            if curl --fail --silent http://localhost:8000/health > /dev/null; then
+
+              echo "================================="
+              echo "Deployment successful!"
+              echo "Health check passed."
+              echo "================================="
+
+            else
+
+              echo "================================="
+              echo "Health check FAILED!"
+              echo "Starting rollback..."
+              echo "================================="
+
+              sudo docker logs fintech-api || true
+
+              sudo docker stop fintech-api || true
+              sudo docker rm fintech-api || true
+
+              if [ -n "$OLD_IMAGE" ]; then
+
+                echo "Starting previous image..."
+
+                sudo docker run -d \
+                  --name fintech-api \
+                  -p 8000:8000 \
+                  $OLD_IMAGE
+
+                sleep 10
+
+                if curl --fail --silent http://localhost:8000/health > /dev/null; then
+                  echo "Rollback successful."
+                else
+                  echo "Rollback failed."
+                  exit 1
+                fi
+
+              else
+
+                echo "No previous image available for rollback."
+                exit 1
+
+              fi
+
+            fi
+
+            echo "Cleaning unused Docker images..."
 
             sudo docker image prune -f
